@@ -1,4 +1,4 @@
-# Unitree Actuator SDK
+# CCBR Leg Test
 
 This repository provides a compact SDK and examples for controlling Unitree actuators, including the GO-M8010-6, A1, and B1 motors. It includes both C++ and Python examples, as well as a GUI for higher-level control.
 
