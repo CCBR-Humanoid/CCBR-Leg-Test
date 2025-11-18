@@ -21,29 +21,12 @@ DIR  = {
     2: +1.0,
 }
 
-
-# GUI/Control gains and jump script values
-BASE_KP = 0.15
-BASE_KD = 0.05
-CROUCH_KP = 0.5
-CROUCH_KD = 0.08
-EXPLODE_KP = 10
-EXPLODE_KD = 0.1
-EXPLODE_TAU_FF = 0 # Nm (set small, hybrid PD already produces torque)
-MAX_TORQUE_NM = 23.0
-
-# Default scripted jump targets (radians)
-SCRIPT_JOINT0 = 0.0
-SCRIPT_J1_START, SCRIPT_J1_END = -1.656, -0.173
-SCRIPT_J2_START, SCRIPT_J2_END =  1.923,  0.74
+# Base PD gains (we’ll override per phase in gui_leg)
+KP = 0.1
+KD = 0.1
 
 # Control loop period (s)
-DT = 0.005  # 200 Hz
-
-# Joint soft limits (output-side radians)
-LIMIT_T1 = math.radians(60)    # hip roll
-LIMIT_T2 = math.radians(140)   # hip pitch
-LIMIT_T3 = math.radians(160)   # knee
+DT = 0.0005  # 2000 Hz
 
 # Max joint velocity we allow (output side) – used only for safety clamps if needed
 VEL_LIMIT_OUTPUT = math.radians(720)

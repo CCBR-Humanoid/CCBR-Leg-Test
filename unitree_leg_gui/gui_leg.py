@@ -13,37 +13,21 @@ from config import (
     MOTOR_IDS, MOTOR_TYPE, CONTROL_MODE,
     GEAR, DIR, DT,
     LIMIT_T1, LIMIT_T2, LIMIT_T3,
-    clamp,
+    BASE_KP, BASE_KD,
+    CROUCH_KP, CROUCH_KD,
+    EXPLODE_KP, EXPLODE_KD,
+    EXPLODE_TAU_FF,
+    MAX_TORQUE_NM,
+    SCRIPT_JOINT0, SCRIPT_J1_START, SCRIPT_J1_END, SCRIPT_J2_START, SCRIPT_J2_END
 )
 from kinematics import (
     fk_leg, ik_leg, pick_closest_solution, clamp_to_workspace,
     l1, l2, l3,
 )
 from unitree_actuator_sdk import SerialPort, MotorCmd, MotorData
+from kinematics import calculate_torque
 
-# =========================
-# Tunables / Gains
-# =========================
-BASE_KP = 0.15
-BASE_KD = 0.05
-
-CROUCH_KP = 0.45
-CROUCH_KD = 0.08
-
-EXPLODE_KP = 2.5
-EXPLODE_KD = 0.08
-
-# feedforward torque used only if you want a bit more push
-EXPLODE_TAU_FF = 0.0  # Nm (set small, hybrid PD already produces torque)
-
-# absolute safety for torque-only sends (motor-side Nm)
-MAX_TORQUE_NM = 23.0
-
-# default scripted jump targets (radians)
-SCRIPT_JOINT0 = 0.0
-SCRIPT_J1_START, SCRIPT_J1_END = -1.557, -0.746
-SCRIPT_J2_START, SCRIPT_J2_END =  2.262,  1.621
-
+## All gains, limits, and jump script values are now imported from config.py
 # =========================
 # Helpers
 # =========================
@@ -62,36 +46,7 @@ def decode_merror(bits: int):
 
 def lerp(a, b, t):
     return a + t*(b - a)
-
-# --- tiny Overleap-style force profile (200 ms, sin^2) ---
-class ForceProfile:
-    def __init__(self, duration_ms=200, impulse=2500.0, fx_max=0.0, fx_prop=0.0):
-        self.duration_ms = duration_ms
-        self.impulse = impulse
-        self.fx_max = fx_max
-        self.fx_prop = fx_prop
-        self.b = 1.0 / max(1.0, duration_ms)  # ms^-1
-
-    def sample(self, t_ms):
-        if t_ms < 0 or t_ms > self.duration_ms:
-            return 0.0, 0.0
-        a = self.impulse / 100.0  # mirrors Overleap scaling
-        s = math.sin(self.b * math.pi * t_ms)
-        fy = a * (s * s)          # vertical (down +)
-        fx = self.fx_prop * fy
-        if abs(fx) > self.fx_max:
-            fx = math.copysign(self.fx_max, fx)
-        return fx, fy
-
-# Jacobianᵀ torque map for the planar (pitch+knee) pair
-def torques_from_foot_force(q_pitch, q_knee, fx, fy):
-    # Using l2, l3 as the planar links (adjust if your naming differs)
-    s1, c1 = math.sin(q_pitch), math.cos(q_pitch)
-    s12, c12 = math.sin(q_pitch + q_knee), math.cos(q_pitch + q_knee)
-    # τ = JᵀF
-    tau_hip  = (l2 * s1 + l3 * s12) * fx + (-l2 * c1 - l3 * c12) * fy
-    tau_knee = (l3 * s12) * fx + (-l3 * c12) * fy
-    return tau_hip, tau_knee
+from jump_control import JumpController
 
 # =========================
 # GUI + Control
@@ -144,6 +99,9 @@ class MotorGUI:
         self.temp_live  = {i: tk.StringVar(value="0") for i in MOTOR_IDS}
         self.err_live   = {i: tk.StringVar(value="OK") for i in MOTOR_IDS}
 
+        # Torque feedback
+        self.torque_live = {i: tk.StringVar(value="0.000") for i in MOTOR_IDS}
+
         # --- layout ---
         frm = ttk.Frame(root, padding=12); frm.grid(sticky="nsew")
         root.columnconfigure(0, weight=1); root.rowconfigure(0, weight=1)
@@ -186,9 +144,16 @@ class MotorGUI:
         ttk.Label(frm, text="y=").grid(row=ee_row+1, column=4, sticky="e"); ttk.Label(frm, textvariable=self.end_eff_xyz["y"], width=9).grid(row=ee_row+1, column=5, sticky="w")
         ttk.Label(frm, text="z=").grid(row=ee_row+2, column=4, sticky="e"); ttk.Label(frm, textvariable=self.end_eff_xyz["z"], width=9).grid(row=ee_row+2, column=5, sticky="w")
 
+        # Live Feedback - Torque
+        for r, mid in enumerate(MOTOR_IDS, start=6):
+            ttk.Label(frm, text=f"Torque J{mid}").grid(row=r, column=6, sticky="w")
+            ttk.Label(frm, textvariable=self.torque_live[mid], width=14).grid(row=r, column=7, sticky="w")
+
         # jump controls
         self._jump_status = tk.StringVar(value="Idle")
         self._jump_phase  = None  # None / "crouch" / "explode"
+        # delegate jump control implementation to JumpController
+        self.jump = JumpController(self, script_joints=(SCRIPT_JOINT0, SCRIPT_J1_START, SCRIPT_J1_END, SCRIPT_J2_START, SCRIPT_J2_END), explode_tau_ff=EXPLODE_TAU_FF)
         ttk.Separator(frm).grid(row=8, column=0, columnspan=8, sticky="we", pady=6)
         self._build_jump_box(frm, row=9)
 
@@ -225,7 +190,7 @@ class MotorGUI:
 
     def _build_ik_controls(self, f):
         max_fwd = l2 + l3
-        min_fwd = -0.25 * (l2 + l3)
+        min_fwd = -0.5 * (l2 + l3)
         max_lat = l1 + l2
         max_down = l2 + l3
         max_up   = -30.0
@@ -247,9 +212,9 @@ class MotorGUI:
 
         ttk.Label(box, text="Status:").grid(row=0, column=0, sticky="e")
         ttk.Label(box, textvariable=self._jump_status).grid(row=0, column=1, sticky="w")
-        ttk.Button(box, text="Scripted spring jump", command=self._start_spring_jump)\
+        ttk.Button(box, text="Scripted spring jump", command=self.jump.start_spring_jump)\
             .grid(row=0, column=2, sticky="we")
-        ttk.Button(box, text="Force-profile jump (Overleap)", command=self._start_force_jump)\
+        ttk.Button(box, text="Force-profile jump (Overleap)", command=self.jump.start_force_jump)\
             .grid(row=0, column=3, sticky="we")
 
         # timing
@@ -267,122 +232,7 @@ class MotorGUI:
         tk.Spinbox(box, from_=0.05, to=2.0, increment=0.05, textvariable=self.jump_explode_s, width=5)\
             .grid(row=1, column=5, sticky="w")
 
-    # -------- jump handlers --------
-    def _start_spring_jump(self):
-        if not self.enabled.get():
-            self.enabled.set(True)
-        if getattr(self, "_spring_running", False):
-            return
-        self.mode.set("Angles")  # drive joints directly
-        self._spring_running = True
-        self._jump_status.set("Jump: hold")
-        threading.Thread(target=self._run_spring_jump, daemon=True).start()
-
-    def _run_spring_jump(self):
-        try:
-            j0 = SCRIPT_JOINT0
-            j1s, j1e = SCRIPT_J1_START, SCRIPT_J1_END
-            j2s, j2e = SCRIPT_J2_START, SCRIPT_J2_END
-
-            hold_s    = float(self.jump_hold_s.get())
-            crouch_s  = float(self.jump_crouch_s.get())
-            explode_s = float(self.jump_explode_s.get())
-
-            # 0) ensure current pose is target joint0
-            self.t1.set(j0)
-
-            # 1) hold to settle (stiff-ish)
-            self._jump_phase = "crouch"
-            t0 = time.time()
-            while time.time() - t0 < max(0.0, hold_s):
-                # keep crouch setpoints during hold (start pose)
-                self.t2.set(j1s); self.t3.set(j2s)
-                time.sleep(DT)
-
-            # 2) go-to crouch smoothly
-            self._jump_status.set("Jump: crouch")
-            self._jump_phase = "crouch"
-            steps = max(1, int(crouch_s / max(DT, 1e-3)))
-            j1_init, j2_init = float(self.t2.get()), float(self.t3.get())
-            for k in range(steps):
-                a = (k + 1) / steps
-                self.t1.set(j0)
-                self.t2.set(lerp(j1_init, j1s, a))
-                self.t3.set(lerp(j2_init, j2s, a))
-                time.sleep(DT)
-
-            time.sleep(0.03)  # tiny settle
-
-            # 3) explode: ramp to extended pose; hybrid PD acts like a spring
-            self._jump_status.set("Jump: explode")
-            self._jump_phase = "explode"
-            steps = max(1, int(explode_s / max(DT, 1e-3)))
-            for k in range(steps):
-                a = (k + 1) / steps
-                self.t1.set(j0)
-                self.t2.set(lerp(j1s, j1e, a))
-                self.t3.set(lerp(j2s, j2e, a))
-                time.sleep(DT)
-
-            # 4) relax (drop to base gains)
-            self._jump_phase = None
-            self._jump_status.set("Jump: flight/relax")
-            time.sleep(0.10)
-
-            self._jump_status.set("Idle")
-        finally:
-            self._spring_running = False
-
-    def _start_force_jump(self):
-        """Overleap-style: push with a short force profile via Jacobianᵀ torques."""
-        if not self.enabled.get():
-            self.enabled.set(True)
-        if getattr(self, "_force_running", False):
-            return
-        self._force_running = True
-        self._jump_status.set("Jump: force")
-        threading.Thread(target=self._run_force_jump, daemon=True).start()
-
-    def _run_force_jump(self):
-        try:
-            # optional: ensure we're in a crouch-ish stance first (light PD via Angles mode)
-            self.mode.set("Angles")
-            self._jump_phase = "crouch"
-            self.t1.set(SCRIPT_JOINT0)
-            self.t2.set(SCRIPT_J1_START)
-            self.t3.set(SCRIPT_J2_START)
-            time.sleep(0.20)
-
-            # switch to force push: foot assumed stationary during short burst
-            prof = ForceProfile(duration_ms=200, impulse=2500.0, fx_max=0.0, fx_prop=0.0)
-            t0 = time.time()
-            while True:
-                t_ms = (time.time() - t0) * 1000.0
-                if t_ms > prof.duration_ms:
-                    break
-
-                jt = self._measured_joint_angles()
-                if jt is None:
-                    break
-                # joints: 0=roll, 1=pitch, 2=knee
-                q_roll, q_pitch, q_knee = jt
-
-                fx, fy = prof.sample(t_ms)
-                tau_pitch, tau_knee = torques_from_foot_force(q_pitch, q_knee, fx, fy)
-
-                self.send_torque_only({
-                    1: tau_pitch,
-                    2: tau_knee,
-                })
-
-                time.sleep(max(0.002, DT))
-
-            # zero torques
-            self.send_torque_only({1: 0.0, 2: 0.0})
-            self._jump_phase = None
-            self._jump_status.set("Idle")
-        finally:
-            self._force_running = False
+    # jump handlers delegated to JumpController (see unitree_leg_gui/jump_control.py)
 
     # -------- core helpers --------
     def rezero(self):
@@ -427,17 +277,17 @@ class MotorGUI:
             c.kp   = 0.0
             c.kd   = 0.0
             tau = float(tau_dict.get(i, 0.0))
-            # absolute clamp for safety
-            tau = clamp(tau, -MAX_TORQUE_NM, +MAX_TORQUE_NM)
+            # clamping removed per request — send requested torque directly
             c.tau  = tau
             self.serial.sendRecv(c, self.datas[i])
 
     def _command_joint_targets(self, t1, t2, t3, phase=None,
                                offset_pitch=0.0, offset_knee=0.0):
         # offsets apply to pitch (1) and knee (2)
-        t1 = clamp(t1, -LIMIT_T1, +LIMIT_T1)
-        t2 = clamp(t2 + offset_pitch, -LIMIT_T2, +LIMIT_T2)
-        t3 = clamp(t3 + offset_knee,  -LIMIT_T3, +LIMIT_T3)
+        # clamping removed per request — use requested targets directly
+        t1 = t1
+        t2 = t2 + offset_pitch
+        t3 = t3 + offset_knee
         t_des = {0: t1, 1: t2, 2: t3}
 
         q_des_abs_rotor = {
@@ -472,14 +322,26 @@ class MotorGUI:
     def update_ui(self):
         jt = self._measured_joint_angles()
         if jt is not None:
-            t1,t2,t3 = jt
+            t1, t2, t3 = jt
             self.theta_live[0].set(f"{t1:.3f}")
             self.theta_live[1].set(f"{t2:.3f}")
             self.theta_live[2].set(f"{t3:.3f}")
-            ee,_ = fk_leg(t1,t2,t3, s_y=self.s_y.get())
+            ee, _ = fk_leg(t1, t2, t3, s_y=self.s_y.get())
             self.end_eff_xyz["x"].set(f"{ee[0]:.1f}")
             self.end_eff_xyz["y"].set(f"{ee[1]:.1f}")
             self.end_eff_xyz["z"].set(f"{ee[2]:.1f}")
+
+            # Calculate and display torque
+            for i in MOTOR_IDS:
+                tau = self.datas[i].tau
+                q_des = self.cmds[i].q
+                q = self.datas[i].q
+                dq_des = self.cmds[i].dq
+                dq = self.datas[i].dq
+                kp = self.cmds[i].kp
+                kd = self.cmds[i].kd
+                torque = calculate_torque(tau, kp, kd, q_des, q, dq_des, dq)
+                self.torque_live[i].set(f"{torque:.3f}")
 
         for i in MOTOR_IDS:
             self.temp_live[i].set(f"{getattr(self.datas[i], 'temp', 0)}")
@@ -531,16 +393,33 @@ class MotorGUI:
                 prev = self.prev_solution[0] if self.prev_solution else None
                 sol = pick_closest_solution(prev, cands)
                 if sol is None:
-                    for i in MOTOR_IDS:
-                        c = self.cmds[i]
-                        c.mode = CONTROL_MODE
-                        c.kp = 0.0; c.kd = 0.0
-                        c.q  = self.datas[i].q
-                        c.dq = 0.0; c.tau = 0.0
-                        self.serial.sendRecv(c, self.datas[i])
+                    # IK failed for requested target. Instead of immediately
+                    # zeroing gains (which makes the motor go limp), hold the
+                    # last valid commanded solution if available. This avoids
+                    # sudden loss of control when targets briefly become
+                    # unreachable.
+                    if getattr(self, "_last_valid_solution", None) is not None:
+                        lv = self._last_valid_solution
+                        # command previous valid joint targets (keep current phase)
+                        self._command_joint_targets(lv[0], lv[1], lv[2], phase=phase)
+                    else:
+                        # no previous solution known — fallback to holding current positions
+                        for i in MOTOR_IDS:
+                            c = self.cmds[i]
+                            c.mode = CONTROL_MODE
+                            c.kp = 0.0; c.kd = 0.0
+                            c.q  = self.datas[i].q
+                            c.dq = 0.0; c.tau = 0.0
+                            self.serial.sendRecv(c, self.datas[i])
+                    # also continue the control loop
+                    # helpful debug log
+                    # print could be replaced with logging
+                    print(f"[IK] no solution for ({x_req:.1f},{y_req:.1f},{z_req:.1f}) — holding last known solution")
                     continue
 
+                # store last valid solution for graceful fallback
                 self.prev_solution = [sol]
+                self._last_valid_solution = sol
                 desired = np.array(sol, dtype=float)
 
                 # gentle slew in IK mode
